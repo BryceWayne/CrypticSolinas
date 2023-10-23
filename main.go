@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
 	"sync"
 
 	"github.com/schollz/progressbar/v3"
@@ -15,10 +14,16 @@ import (
 type State struct {
 	Counter  int
 	Curve    string
-	Attempts map[string]bool // Using a map for fast lookup
+	Attempts map[string]bool
 }
 
-var mu sync.Mutex // Mutex for concurrent map access
+type HashInfo struct {
+	Phrase string
+	Hash   string
+}
+
+var targetHashesMap map[string]bool
+var mu sync.Mutex
 
 func SaveState(state *State) error {
 	file, err := os.Create("state.json")
@@ -63,16 +68,11 @@ func LoadState() (*State, error) {
 	return state, err
 }
 
-func generateHash(phrase string, ch chan<- string, phraseHashes map[string]string) {
+func generateHash(phrase string, ch chan<- HashInfo) {
 	h := sha1.New()
 	h.Write([]byte(phrase))
 	hash := hex.EncodeToString(h.Sum(nil))
-
-	mu.Lock()
-	phraseHashes[phrase] = hash
-	mu.Unlock()
-
-	ch <- hash
+	ch <- HashInfo{Phrase: phrase, Hash: hash}
 }
 
 var targetHashes = [...]string{
@@ -83,50 +83,40 @@ var targetHashes = [...]string{
 	"D09E8800291CB85396CC6717393284AAA0DA64BA",
 }
 
-var curveNames = [...]string{
-	"P-192", "P-224", "P-256", "P-384", "P-521",
-}
-
-func generateCandidatePhrases() []string {
-	candidates := []string{}
-	separators := []string{" ", ".", "(", ")", "[", "]", "{", "}", "Counter:", "Curve:", "Count:"}
-
-	for i := 0; i < 2400; i++ {
-		counterStr := strconv.Itoa(i)
-		for _, curve := range curveNames {
-			parts := []string{"Jerry", curve, counterStr}
-			for _, sep1 := range separators {
-				for _, sep2 := range separators {
-					for _, sep3 := range separators {
-						candidate := parts[0] + sep1 + parts[1] + sep2 + parts[2] + sep3
-						candidates = append(candidates, candidate)
-					}
-				}
-			}
-		}
-	}
-	return candidates
-}
-
 func main() {
-	// Load existing state
 	state, err := LoadState()
 	if err != nil {
-		// Initialize if loading failed
 		state = &State{Counter: 0, Curve: "NIST P-192", Attempts: make(map[string]bool)}
 	}
 
-	if state.Attempts == nil {
-		state.Attempts = make(map[string]bool)
+	words, err := loadDictionary()
+	if err != nil {
+		fmt.Println("Error loading dictionary:", err)
+		return
+	}
+
+	targetHashesMap = make(map[string]bool)
+	for _, hash := range targetHashes {
+		targetHashesMap[hash] = true
 	}
 
 	var wg sync.WaitGroup
-	ch := make(chan string)
+	ch := make(chan HashInfo)
 
 	candidatePhrases := generateCandidatePhrases()
-	phraseHashes := make(map[string]string) // Create a map to store phrase and its corresponding hash
 
-	bar := progressbar.Default(int64(len(candidatePhrases)))
+	many := 10_000_000
+	bar := progressbar.Default(int64(many))
+	for i := 0; i < many; i++ {
+		randomWordLength := 1 + i%10
+		randomPhrase := generateRandomPhrase(words, randomWordLength)
+		candidatePhrases = append(candidatePhrases, randomPhrase)
+		candidatePhrases = append(candidatePhrases, randomPhrase+".")
+		bar.Add(1)
+	}
+
+	bar = progressbar.Default(int64(len(candidatePhrases)))
+
 	for _, phrase := range candidatePhrases {
 		mu.Lock()
 		if _, exists := state.Attempts[phrase]; exists {
@@ -137,8 +127,11 @@ func main() {
 		mu.Unlock()
 
 		wg.Add(1)
-		bar.Add(1)
-		go generateHash(phrase, ch, phraseHashes) // Updated to populate phraseHashes
+		go func(phrase string) {
+			defer wg.Done()
+			generateHash(phrase, ch)
+			bar.Add(1)
+		}(phrase)
 	}
 
 	go func() {
@@ -146,22 +139,13 @@ func main() {
 		close(ch)
 	}()
 
-	// Check hash in the main thread
-	for hash := range ch {
-		mu.Lock()
-		for phrase, calculatedHash := range phraseHashes {
-			if calculatedHash == hash {
-				for _, target := range targetHashes {
-					if hash == target {
-						fmt.Printf("Match found! Hash: %s\n", hash)
-						if err := SaveSeed(phrase, hash); err != nil {
-							fmt.Printf("Error saving seed: %s\n", err)
-						}
-					}
-				}
+	for info := range ch {
+		if targetHashesMap[info.Hash] {
+			fmt.Printf("Match found! Hash: %s\n", info.Hash)
+			if err := SaveSeed(info.Phrase, info.Hash); err != nil {
+				fmt.Printf("Error saving seed: %s\n", err)
 			}
 		}
-		mu.Unlock()
 	}
 
 	if err := SaveState(state); err != nil {
