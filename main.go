@@ -4,41 +4,22 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 
 	"github.com/schollz/progressbar/v3"
 )
-
-type State struct {
-	Counter  int
-	Curve    string
-	Attempts map[string]bool
-}
 
 type HashInfo struct {
 	Phrase string
 	Hash   string
 }
 
-var targetHashesMap map[string]bool
+var targetHashesMap map[[20]byte]bool
 var mu sync.Mutex
-
-func SaveState(state *State) error {
-	file, err := os.Create("state.json")
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	data, err := json.MarshalIndent(state, "", "    ") // Indentation of 4 spaces
-	if err != nil {
-		return err
-	}
-	_, err = file.Write(data)
-	return err
-}
 
 func SaveSeed(phrase, hash string) error {
 	mu.Lock()
@@ -56,25 +37,6 @@ func SaveSeed(phrase, hash string) error {
 	return err
 }
 
-func LoadState() (*State, error) {
-	file, err := os.Open("state.json")
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	state := &State{}
-	decoder := json.NewDecoder(file)
-	err = decoder.Decode(state)
-	return state, err
-}
-
-func generateHash(phrase string, ch chan<- HashInfo) {
-	h := sha1.New()
-	h.Write([]byte(phrase))
-	hash := hex.EncodeToString(h.Sum(nil))
-	ch <- HashInfo{Phrase: phrase, Hash: hash}
-}
-
 var targetHashes = [...]string{
 	"3045AE6FC8422F64ED579528D38120EAE12196D5",
 	"BD71344799D5C7FCDC45B59FA3B9AB8F6A948BC5",
@@ -84,10 +46,9 @@ var targetHashes = [...]string{
 }
 
 func main() {
-	state, err := LoadState()
-	if err != nil {
-		state = &State{Counter: 0, Curve: "NIST P-192", Attempts: make(map[string]bool)}
-	}
+	mode := flag.String("mode", "cpu", "Execution mode: cpu or gpu")
+	threads := flag.Int("threads", runtime.NumCPU(), "Number of threads for CPU mode")
+	flag.Parse()
 
 	words, err := loadDictionary()
 	if err != nil {
@@ -95,60 +56,97 @@ func main() {
 		return
 	}
 
-	targetHashesMap = make(map[string]bool)
-	for _, hash := range targetHashes {
-		targetHashesMap[hash] = true
+	targetHashesMap = make(map[[20]byte]bool)
+	for _, hashHex := range targetHashes {
+		decoded, err := hex.DecodeString(hashHex)
+		if err == nil && len(decoded) == 20 {
+			var b [20]byte
+			copy(b[:], decoded)
+			targetHashesMap[b] = true
+		}
 	}
+
+	candidateCh := make(chan string, 100000)
+
+	// Start phrase generation
+	var wgGen sync.WaitGroup
+	wgGen.Add(1)
+	go func() {
+		defer wgGen.Done()
+		generateCandidatePhrases(candidateCh)
+
+		many := 10_000_000
+		for i := 0; i < many; i++ {
+			randomWordLength := 1 + i%10
+			randomPhrase := generateRandomPhrase(words, randomWordLength)
+			candidateCh <- randomPhrase
+			candidateCh <- randomPhrase + "."
+		}
+		close(candidateCh)
+	}()
+
+	if *mode == "gpu" {
+		fmt.Println("GPU mode selected. Dumping phrases to candidates.txt...")
+		file, err := os.Create("candidates.txt")
+		if err != nil {
+			fmt.Println("Error creating candidates.txt:", err)
+			return
+		}
+		defer file.Close()
+
+		bar := progressbar.Default(-1, "Generating")
+		for phrase := range candidateCh {
+			file.WriteString(phrase + "\n")
+			bar.Add(1)
+		}
+		wgGen.Wait()
+
+		// Write target hashes to file for hashcat
+		targetFile, err := os.Create("target_hashes.txt")
+		if err == nil {
+			for _, hashHex := range targetHashes {
+				targetFile.WriteString(hashHex + "\n")
+			}
+			targetFile.Close()
+		}
+
+		fmt.Println("\nDump complete. You can use hashcat with these files:")
+		fmt.Println("hashcat -m 300 target_hashes.txt candidates.txt")
+		return
+	}
+
+	// CPU Mode
+	fmt.Printf("CPU mode starting with %d threads...\n", *threads)
+	bar := progressbar.Default(-1, "Hashing")
 
 	var wg sync.WaitGroup
-	ch := make(chan HashInfo)
+	chInfo := make(chan HashInfo, 100)
 
-	candidatePhrases := generateCandidatePhrases()
-
-	many := 10_000_000
-	bar := progressbar.Default(int64(many))
-	for i := 0; i < many; i++ {
-		randomWordLength := 1 + i%10
-		randomPhrase := generateRandomPhrase(words, randomWordLength)
-		candidatePhrases = append(candidatePhrases, randomPhrase)
-		candidatePhrases = append(candidatePhrases, randomPhrase+".")
-		bar.Add(1)
-	}
-
-	bar = progressbar.Default(int64(len(candidatePhrases)))
-
-	for _, phrase := range candidatePhrases {
-		mu.Lock()
-		if _, exists := state.Attempts[phrase]; exists {
-			mu.Unlock()
-			continue
-		}
-		state.Attempts[phrase] = true
-		mu.Unlock()
-
+	for i := 0; i < *threads; i++ {
 		wg.Add(1)
-		go func(phrase string) {
+		go func() {
 			defer wg.Done()
-			generateHash(phrase, ch)
-			bar.Add(1)
-		}(phrase)
+			for phrase := range candidateCh {
+				hashBytes := sha1.Sum([]byte(phrase))
+				if targetHashesMap[hashBytes] {
+					hashHex := hex.EncodeToString(hashBytes[:])
+					chInfo <- HashInfo{Phrase: phrase, Hash: hashHex}
+				}
+				bar.Add(1)
+			}
+		}()
 	}
 
 	go func() {
 		wg.Wait()
-		close(ch)
+		close(chInfo)
 	}()
 
-	for info := range ch {
-		if targetHashesMap[info.Hash] {
-			fmt.Printf("Match found! Hash: %s\n", info.Hash)
-			if err := SaveSeed(info.Phrase, info.Hash); err != nil {
-				fmt.Printf("Error saving seed: %s\n", err)
-			}
+	for info := range chInfo {
+		fmt.Printf("\nMatch found! Hash: %s Phrase: %s\n", info.Hash, info.Phrase)
+		if err := SaveSeed(info.Phrase, info.Hash); err != nil {
+			fmt.Printf("Error saving seed: %s\n", err)
 		}
 	}
-
-	if err := SaveState(state); err != nil {
-		fmt.Printf("Error saving state: %s\n", err)
-	}
+	wgGen.Wait()
 }
