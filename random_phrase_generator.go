@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"math/rand"
 	"os"
-	"strings"
 	"time"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 func loadDictionary() ([]string, error) {
 	filename := "dictionary.txt"
@@ -25,29 +28,41 @@ func loadDictionary() ([]string, error) {
 	return words, scanner.Err()
 }
 
-func generateRandomPhrase(words []string, phraseLength int) string {
-	rand.Seed(time.Now().UnixNano())
-	phrase := ""
-	for i := 0; i < phraseLength; i++ {
-		randomIndex := rand.Intn(len(words))
-		phrase += words[randomIndex]
-		if i == 0 {
-			phrase = strings.Title(phrase)
-		}
-		if i < phraseLength-1 {
-			phrase += " "
-		}
+func capitalizeWord(word string) string {
+	if len(word) == 0 {
+		return word
 	}
-	return phrase
+	if word[0] >= 'a' && word[0] <= 'z' {
+		b := make([]byte, len(word))
+		copy(b, word)
+		b[0] = b[0] - ('a' - 'A')
+		return string(b)
+	}
+	return word
 }
 
-// func main() {
-// 	words, err := loadDictionary()
-// 	if err != nil {
-// 		fmt.Println("Error loading dictionary:", err)
-// 		return
-// 	}
+func generateRandomPhrase(words []string, phraseLength int) string {
+	if phraseLength <= 0 {
+		return ""
+	}
 
-// 	randomPhrase := generateRandomPhrase(words, 5) // Generate a 5-word random phrase
-// 	fmt.Println("Generated random phrase:", randomPhrase)
-// }
+	// Pre-allocate length estimation
+	estimatedLen := phraseLength * 8
+	buf := make([]byte, 0, estimatedLen)
+
+	for i := 0; i < phraseLength; i++ {
+		randomIndex := rand.Intn(len(words))
+		word := words[randomIndex]
+
+		if i == 0 {
+			word = capitalizeWord(word)
+		}
+
+		buf = append(buf, word...)
+
+		if i < phraseLength-1 {
+			buf = append(buf, ' ')
+		}
+	}
+	return string(buf)
+}
